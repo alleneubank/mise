@@ -1,5 +1,22 @@
 # Changelog
 
+## [2026.7.18](https://github.com/jdx/mise/compare/v2026.7.17..v2026.7.18) - 2026-07-30
+
+### 🐛 Bug Fixes
+
+- **(backend)** resolve a spawnable program on Windows instead of a bare name by @JamBalaya56562 in [#11486](https://github.com/jdx/mise/pull/11486)
+- **(cargo)** reinstall when install options change by @Marukome0743 in [#11480](https://github.com/jdx/mise/pull/11480)
+
+### 📦 Aqua Registry Updates
+
+#### New Packages (1)
+
+- [`herdrdev/herdr`](https://github.com/herdrdev/herdr)
+
+#### Updated Packages (1)
+
+- [`entireio/cli`](https://github.com/entireio/cli)
+
 ## [2026.7.17](https://github.com/jdx/mise/compare/v2026.7.16..v2026.7.17) - 2026-07-29
 
 ### 🚀 Features
