@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+# A foreign wrapper can re-resolve this unconfigured tool through mise's shim.
+# The shim skips itself during system fallback, finds the wrapper, and must
+# eventually report a bounded recursion error instead of cycling forever.
+tool="shim-fallback-recursion-test"
+missedir="$TMPDIR/mise-bin"
+wrapperdir="$TMPDIR/wrapper-bin"
+
+export MISE_NOT_FOUND_AUTO_INSTALL=0
+mkdir -p "$missedir" "$wrapperdir"
+ln -s "$(command -v mise)" "$missedir/$tool"
+
+cat >"$wrapperdir/$tool" <<'WRAPPER'
+#!/usr/bin/env bash
+exec "$(command -v shim-fallback-recursion-test)" "$@"
+WRAPPER
+chmod +x "$wrapperdir/$tool"
+
+# Mise skips itself while looking for a system fallback, then finds the foreign
+# wrapper. Because this shim lives outside mise's shims directory, the wrapper
+# resolves it first and re-enters mise to form the regression cycle.
+export PATH="$missedir:$wrapperdir:$PATH"
+
+status=0
+output="$(run_with_timeout 60 "$tool")" || status=$?
+
+[[ $status -ne 0 ]] || fail "shim fallback invocation unexpectedly succeeded"
+[[ $status -ne 124 ]] || fail "shim fallback invocation timed out with status $status instead of detecting recursion"
+assert_contains_text "$output" "shim fallback recursion detected"

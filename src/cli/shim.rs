@@ -12,7 +12,7 @@ use itertools::Itertools;
 #[cfg(windows)]
 use path_absolutize::Absolutize;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -42,12 +42,13 @@ pub(crate) async fn handle_shim() -> Result<()> {
         *env::MISE_SHIM_PATH.write().unwrap() = Some(shim_path.clone());
         env::set_var(env::MISE_SHIM_PATH_ENV, &shim_path);
     }
+    let fallback_chain = FallbackChain::take_inherited();
     let mut config = Config::get().await?;
     let mut args = env::ARGS.read().unwrap().clone();
     env::PREFER_OFFLINE.store(true, Ordering::Relaxed);
     trace!("shim[{bin_name}] args: {}", args.join(" "));
     let (mut bin, mut ts, mut wrapper) =
-        which_shim(&mut config, &env::MISE_BIN_NAME, &args).await?;
+        which_shim(&mut config, &env::MISE_BIN_NAME, &args, &fallback_chain).await?;
     // A due `auto_update` upgrades this shim's tool before it runs, so look
     // the binary up again to launch the new version. Never while completing.
     let shim_name = command_name_without_exe_suffix(&env::MISE_BIN_NAME);
@@ -55,7 +56,8 @@ pub(crate) async fn handle_shim() -> Result<()> {
         && super::tool_update::update_before_launch(&config, &ts, shim_name).await
     {
         config = Config::reset().await?;
-        (bin, ts, wrapper) = which_shim(&mut config, &env::MISE_BIN_NAME, &args).await?;
+        (bin, ts, wrapper) =
+            which_shim(&mut config, &env::MISE_BIN_NAME, &args, &fallback_chain).await?;
     }
     args[0] = bin.to_string_lossy().to_string();
     if let Some(wrapper) = &wrapper {
@@ -214,10 +216,85 @@ pub(crate) fn is_offline_completion(shim_name: &str, args: &[String]) -> bool {
     is_usage && args.get(1).is_some_and(|arg| arg == "complete-word")
 }
 
+/// Carries a process's system-fallback handoffs across `exec`. Each entry is a
+/// [`FALLBACK_ENTRY_SEPARATOR`]-joined `(bin name, fallback path)` pair; the value starts with
+/// the PID that owns the chain.
+const FALLBACK_CHAIN_ENV: &str = "__MISE_SHIM_FALLBACK_CHAIN";
+const FALLBACK_CHAIN_SEPARATOR: char = '\x1f';
+const FALLBACK_ENTRY_SEPARATOR: char = '\x1e';
+/// Backstop for an exec chain that keeps growing through distinct wrappers without repeating.
+const FALLBACK_CHAIN_MAX: usize = 32;
+
+/// The system-fallback handoffs this process has already made.
+///
+/// A shim with no version execs the next `bin_name` on PATH. When that program is a wrapper
+/// that execs the bare name again, it lands back on the shim, and the two hand off forever.
+/// Every hop of that cycle is an `exec`, so the PID never changes. A tool that legitimately
+/// runs itself again (`bun run build` running `bun build`) does so in a child process with a
+/// new PID. So the chain belongs to one PID: a chain inherited from another process is
+/// discarded, and a `(bin name, fallback)` pair that repeats within one process is a cycle.
+///
+/// The pair, not a depth count, decides: a finite chain of distinct wrappers is valid at any
+/// depth up to the backstop.
+///
+/// Windows shims start the tool as a child process, so each hop has a new PID and this never
+/// reports a cycle there.
+#[derive(Debug, Default, PartialEq)]
+struct FallbackChain {
+    entries: Vec<String>,
+}
+
+impl FallbackChain {
+    /// Takes the chain from the environment. Removing it means a resolution other than a
+    /// system fallback ends the chain, and the fallback branch puts it back extended.
+    fn take_inherited() -> Self {
+        let inherited = env::var(FALLBACK_CHAIN_ENV).unwrap_or_default();
+        env::remove_var(FALLBACK_CHAIN_ENV);
+        Self::parse(&inherited, std::process::id())
+    }
+
+    fn parse(value: &str, pid: u32) -> Self {
+        let mut fields = value.split(FALLBACK_CHAIN_SEPARATOR);
+        let owner = fields.next().and_then(|field| field.parse::<u32>().ok());
+        if owner != Some(pid) {
+            return Self::default();
+        }
+        Self {
+            entries: fields.map(str::to_owned).collect(),
+        }
+    }
+
+    /// The environment value after handing `bin_name` off to `fallback`, or an error when
+    /// that handoff already happened in this process.
+    fn extended(&self, pid: u32, bin_name: &str, fallback: &Path) -> Result<String> {
+        let entry = format!(
+            "{bin_name}{FALLBACK_ENTRY_SEPARATOR}{}",
+            fallback.to_string_lossy()
+        );
+        if self.entries.contains(&entry) {
+            bail!(
+                "shim fallback recursion detected for {bin_name}: {} keeps resolving back through mise. Set a version for {bin_name}, or remove mise's shim for it.",
+                display_path(fallback)
+            );
+        }
+        if self.entries.len() >= FALLBACK_CHAIN_MAX {
+            bail!(
+                "shim fallback recursion detected for {bin_name}: the system fallback chain reached its {FALLBACK_CHAIN_MAX}-entry limit before executing {}. Set a version for {bin_name}, or remove mise's shim for it.",
+                display_path(fallback)
+            );
+        }
+        Ok(std::iter::once(pid.to_string())
+            .chain(self.entries.iter().cloned())
+            .chain(std::iter::once(entry))
+            .join(&FALLBACK_CHAIN_SEPARATOR.to_string()))
+    }
+}
+
 async fn which_shim(
     config: &mut Arc<Config>,
     bin_name: &str,
     args: &[String],
+    fallback_chain: &FallbackChain,
 ) -> Result<(PathBuf, Toolset, Option<CommandWrapper>)> {
     let shim_name = command_name_without_exe_suffix(bin_name);
     let completion_offline = is_offline_completion(shim_name, args);
@@ -336,6 +413,12 @@ async fn which_shim(
                 if file::canonicalize_cached(&bin).is_some_and(|bin| bin == mise_bin) {
                     continue;
                 }
+                let chain = fallback_chain.extended(
+                    std::process::id(),
+                    bin_name,
+                    &file::canonicalize_or_self(&bin),
+                )?;
+                env::set_var(FALLBACK_CHAIN_ENV, chain);
                 trace!("shim[{bin_name}] SYSTEM {bin}", bin = display_path(&bin));
                 return Ok((bin, ts, None));
             }
@@ -348,5 +431,72 @@ async fn which_shim(
     match err_no_version_set(config, ts, shim_name, tvs).await {
         Ok(_) => unreachable!("err_no_version_set always returns an error"),
         Err(err) => Err(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PID: u32 = 4242;
+
+    fn chain_after(handoffs: &[(&str, &str)]) -> String {
+        handoffs
+            .iter()
+            .fold(String::new(), |value, (bin_name, fallback)| {
+                FallbackChain::parse(&value, PID)
+                    .extended(PID, bin_name, Path::new(fallback))
+                    .unwrap()
+            })
+    }
+
+    #[test]
+    fn repeated_handoff_in_one_process_is_a_cycle() {
+        let value = chain_after(&[("npx", "/wrappers/npx")]);
+        let err = FallbackChain::parse(&value, PID)
+            .extended(PID, "npx", Path::new("/wrappers/npx"))
+            .unwrap_err();
+        assert!(err.to_string().contains("recursion detected for npx"));
+    }
+
+    #[test]
+    fn same_handoff_from_a_child_process_is_not_a_cycle() {
+        let value = chain_after(&[("bun", "/home/u/.bun/bin/bun")]);
+        let child = FallbackChain::parse(&value, PID + 1);
+        assert_eq!(child, FallbackChain::default());
+        assert!(
+            child
+                .extended(PID + 1, "bun", Path::new("/home/u/.bun/bin/bun"))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn distinct_handoffs_extend_the_chain_up_to_the_limit() {
+        let handoffs = (0..FALLBACK_CHAIN_MAX)
+            .map(|n| (format!("tool{n}"), format!("/wrappers/tool{n}")))
+            .collect_vec();
+        let borrowed = handoffs
+            .iter()
+            .map(|(bin_name, fallback)| (bin_name.as_str(), fallback.as_str()))
+            .collect_vec();
+        let value = chain_after(&borrowed);
+        assert_eq!(
+            FallbackChain::parse(&value, PID).entries.len(),
+            FALLBACK_CHAIN_MAX
+        );
+        let err = FallbackChain::parse(&value, PID)
+            .extended(PID, "next", Path::new("/wrappers/next"))
+            .unwrap_err();
+        assert!(err.to_string().contains("limit"));
+    }
+
+    #[test]
+    fn unowned_or_malformed_values_start_an_empty_chain() {
+        assert_eq!(FallbackChain::parse("", PID), FallbackChain::default());
+        assert_eq!(
+            FallbackChain::parse("not-a-pid\x1fnpx\x1e/w/npx", PID),
+            FallbackChain::default()
+        );
     }
 }

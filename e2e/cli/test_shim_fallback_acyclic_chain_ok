@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+
+# An unconfigured tool may delegate through a finite chain of foreign wrappers.
+# This must complete even when the chain is deeper than the fallback safety cap:
+# depth alone does not prove recursion.
+missedir="$TMPDIR/mise-bin"
+wrapperdir="$TMPDIR/wrapper-bin"
+
+export MISE_NOT_FOUND_AUTO_INSTALL=0
+mkdir -p "$missedir" "$wrapperdir"
+
+for tool in {1..12}; do
+  ln -s "$(command -v mise)" "$missedir/tool$tool"
+done
+
+for tool in {1..11}; do
+  next_tool=$((tool + 1))
+  cat >"$wrapperdir/tool$tool" <<WRAPPER
+#!/usr/bin/env bash
+exec tool$next_tool "\$@"
+WRAPPER
+  chmod +x "$wrapperdir/tool$tool"
+done
+
+cat >"$wrapperdir/tool12" <<'WRAPPER'
+#!/usr/bin/env bash
+echo shim-fallback-acyclic-chain-complete
+WRAPPER
+chmod +x "$wrapperdir/tool12"
+
+# These shims intentionally live outside MISE_DATA_DIR/shims: the e2e harness
+# strips that directory from a child PATH while execing a resolved tool.
+export PATH="$missedir:$wrapperdir:$PATH"
+
+status=0
+output="$(run_with_timeout 60 tool1)" || status=$?
+
+[[ $status -eq 0 ]] || fail "acyclic shim fallback chain exited with status $status: $output"
+[[ $status -ne 124 ]] || fail "acyclic shim fallback chain timed out"
+assert_contains_text "$output" "shim-fallback-acyclic-chain-complete"

@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+
+# A system fallback may run its own name again in a child process, as
+# `bun run build` runs `bun build`. That nested call resolves through the shim to
+# the same fallback, but it is not a cycle: only a re-entry in the same process
+# (an exec chain) is.
+tool="shim-fallback-nested-test"
+missedir="$TMPDIR/mise-bin"
+realdir="$TMPDIR/real-bin"
+
+export MISE_NOT_FOUND_AUTO_INSTALL=0
+mkdir -p "$missedir" "$realdir"
+ln -s "$(command -v mise)" "$missedir/$tool"
+
+cat >"$realdir/$tool" <<'TOOL'
+#!/usr/bin/env bash
+if [[ ${1:-} == inner ]]; then
+  echo shim-fallback-nested-complete
+else
+  shim-fallback-nested-test inner
+fi
+TOOL
+chmod +x "$realdir/$tool"
+
+# These shims intentionally live outside MISE_DATA_DIR/shims: the e2e harness
+# strips that directory from a child PATH while execing a resolved tool.
+export PATH="$missedir:$realdir:$PATH"
+
+status=0
+output="$(run_with_timeout 60 "$tool" 2>&1)" || status=$?
+
+[[ $status -eq 0 ]] || fail "nested shim fallback exited with status $status: $output"
+assert_contains_text "$output" "shim-fallback-nested-complete"
